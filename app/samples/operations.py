@@ -201,6 +201,11 @@ class DestructionService:
             after=updated,
             metadata={"request_id": request_id, "certificate_digest": certificate},
         )
+        from app.samples.loans import LoanWorkflowService
+
+        LoanWorkflowService(self.connection, self.clock).revalidate_sample(
+            sample["id"], reason="destroyed", actor=principal
+        )
         return {"record": record, "sample": updated, "replayed": False}
 
 

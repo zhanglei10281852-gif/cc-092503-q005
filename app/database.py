@@ -218,8 +218,11 @@ CREATE TABLE IF NOT EXISTS loans (
     sample_id INTEGER NOT NULL REFERENCES samples(id),
     borrower_user_id INTEGER NOT NULL REFERENCES users(id),
     approved_request_id INTEGER REFERENCES approval_requests(id),
+    request_id INTEGER REFERENCES loan_requests(id),
     quantity REAL NOT NULL CHECK(quantity > 0),
     due_at TEXT NOT NULL,
+    original_due_at TEXT,
+    renewals_count INTEGER NOT NULL DEFAULT 0,
     returned_quantity REAL NOT NULL DEFAULT 0 CHECK(returned_quantity >= 0),
     state TEXT NOT NULL CHECK(state IN ('active','partially_returned','returned','overdue','disputed')),
     version INTEGER NOT NULL DEFAULT 1,
@@ -227,6 +230,62 @@ CREATE TABLE IF NOT EXISTS loans (
     updated_at TEXT NOT NULL,
     CHECK(returned_quantity <= quantity)
 );
+
+CREATE TABLE IF NOT EXISTS loan_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_code TEXT NOT NULL UNIQUE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    applicant_user_id INTEGER NOT NULL REFERENCES users(id),
+    borrower_user_id INTEGER NOT NULL REFERENCES users(id),
+    kind TEXT NOT NULL CHECK(kind IN ('borrow','renewal')),
+    parent_loan_id INTEGER REFERENCES loans(id),
+    priority INTEGER NOT NULL DEFAULT 100 CHECK(priority >= 0 AND priority <= 1000),
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    requested_due_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued','approved','rejected','cancelled','invalidated')),
+    reject_reason TEXT NOT NULL DEFAULT '',
+    invalidate_reason TEXT NOT NULL DEFAULT '',
+    decided_by INTEGER REFERENCES users(id),
+    decided_at TEXT,
+    fulfilled_loan_id INTEGER REFERENCES loans(id),
+    fulfilled_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loan_requests_sample ON loan_requests(sample_id, state);
+CREATE INDEX IF NOT EXISTS idx_loan_requests_queue ON loan_requests(priority DESC, id);
+
+CREATE TABLE IF NOT EXISTS loan_recalls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    loan_id INTEGER NOT NULL REFERENCES loans(id),
+    episode_due_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    outstanding_quantity REAL NOT NULL CHECK(outstanding_quantity >= 0),
+    triggered_by_user_id INTEGER REFERENCES users(id),
+    job_id INTEGER REFERENCES background_jobs(id),
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution TEXT NOT NULL DEFAULT '',
+    UNIQUE(loan_id, episode_due_at)
+);
+CREATE INDEX IF NOT EXISTS idx_loan_recalls_loan ON loan_recalls(loan_id);
+
+CREATE TABLE IF NOT EXISTS loan_reservation_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    loan_id INTEGER REFERENCES loans(id),
+    loan_request_id INTEGER REFERENCES loan_requests(id),
+    change REAL NOT NULL,
+    quantity REAL NOT NULL CHECK(quantity >= 0),
+    reserved_after REAL NOT NULL CHECK(reserved_after >= 0),
+    reason TEXT NOT NULL,
+    actor_user_id INTEGER REFERENCES users(id),
+    correlation_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reservation_ledger_sample ON loan_reservation_ledger(sample_id, id);
+CREATE INDEX IF NOT EXISTS idx_reservation_ledger_loan ON loan_reservation_ledger(loan_id);
 
 CREATE TABLE IF NOT EXISTS consumption_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -348,6 +407,7 @@ PERMISSIONS = [
     ("samples.write", "维护样品", "samples", "write"),
     ("samples.consume", "登记消耗", "samples", "consume"),
     ("samples.destroy", "执行销毁", "samples", "destroy"),
+    ("loans.apply", "申请借用", "loans", "apply"),
     ("loans.manage", "管理借用", "loans", "manage"),
     ("inventory.manage", "管理盘点", "inventory", "manage"),
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
@@ -401,10 +461,29 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_columns(connection: sqlite3.Connection) -> None:
+    """Backfill columns introduced after the initial release (SQLite has no ALTER TYPE)."""
+    additions = {
+        "loans": (
+            ("request_id", "INTEGER REFERENCES loan_requests(id)"),
+            ("original_due_at", "TEXT"),
+            ("renewals_count", "INTEGER NOT NULL DEFAULT 0"),
+        ),
+    }
+    for table, columns in additions.items():
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not existing:
+            continue
+        for name, declaration in columns:
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     connection = get_connection()
     connection.executescript(SCHEMA)
+    _ensure_columns(connection)
     with transaction(immediate=True) as connection:
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
@@ -433,7 +512,7 @@ def init_db() -> None:
                 "samples.read", "samples.write", "samples.consume", "samples.destroy",
                 "loans.manage", "inventory.manage", "anomalies.manage",
             ],
-            "researcher": ["samples.read", "samples.consume"],
+            "researcher": ["samples.read", "samples.consume", "loans.apply"],
             "approver": ["samples.read", "approvals.decide"],
             "auditor": ["samples.read", "audit.read"],
         }

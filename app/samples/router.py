@@ -15,6 +15,8 @@ from app.samples.schemas import (
     LoanCreate,
     LoanReturn,
     LocationCreate,
+    QuarantineReleaseRequest,
+    QuarantineRequest,
     SampleCreate,
 )
 from app.samples.service import AnomalyService, ApprovalService, LoanService, LocationService, SampleLifecycleService
@@ -63,6 +65,18 @@ def get_sample(sample_id: int, principal: Principal = Depends(current_principal)
 def aliquot(sample_id: int, payload: AliquotRequest, principal: Principal = Depends(current_principal)):
     with transaction(immediate=True) as connection:
         return SampleLifecycleService(connection).aliquot(principal, sample_id, payload.model_dump())
+
+
+@router.post("/{sample_id}/quarantine")
+def quarantine_sample(sample_id: int, payload: QuarantineRequest, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return SampleLifecycleService(connection).quarantine(principal, sample_id, payload.reason)
+
+
+@router.post("/{sample_id}/quarantine/release")
+def release_quarantine(sample_id: int, payload: QuarantineReleaseRequest, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return SampleLifecycleService(connection).release_quarantine(principal, sample_id, payload.note)
 
 
 @router.post("/{sample_id}/consumptions", status_code=status.HTTP_201_CREATED)

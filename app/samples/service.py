@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
-from app.core.errors import ConflictError, NotFoundError, ValidationError
+from app.core.errors import ConflictError, ValidationError
 from app.core.security import Principal
 from app.samples.repository import AnomalyRepository, ApprovalRepository, BatchRepository, LocationRepository, SampleRepository
 from app.services.audit import AuditService
@@ -142,7 +142,58 @@ class SampleLifecycleService:
         )
         self.samples.append_event(sample_id, "aliquot.source", principal.user_id, now, quantity_delta=-data["requested_quantity"], details={"operation_code": operation_code, "child_ids": [item["id"] for item in children]})
         self.audit.record(principal, "sample.aliquot", "sample", str(sample_id), before=parent, after=updated_parent, metadata={"operation_code": operation_code})
+        self._revalidate_loans(sample_id, principal)
         return {"operation_code": operation_code, "parent": updated_parent, "children": children}
+
+    def _revalidate_loans(self, sample_id: int, principal: Principal) -> None:
+        from app.samples.loans import LoanWorkflowService
+
+        LoanWorkflowService(self.connection, self.clock).revalidate_after_quantity_change(
+            sample_id, actor=principal
+        )
+
+    def quarantine(self, principal: Principal, sample_id: int, reason: str) -> dict[str, Any]:
+        principal.require("samples.write")
+        sample = self.samples.get(sample_id)
+        if sample["lifecycle_state"] in {"destroyed", "consumed"}:
+            raise ConflictError("样品已终结，不能隔离")
+        before = dict(sample)
+        now = to_storage(self.clock.now())
+        updated = self.samples.set_state(sample_id, "quarantined", sample["version"], now)
+        self.samples.append_event(
+            sample_id, "sample.quarantined", principal.user_id, now,
+            from_state=sample["lifecycle_state"], to_state="quarantined", details={"reason": reason},
+        )
+        self.audit.record(
+            principal, "sample.quarantine", "sample", str(sample_id),
+            before=before, after=updated, metadata={"reason": reason},
+        )
+        from app.samples.loans import LoanWorkflowService
+
+        LoanWorkflowService(self.connection, self.clock).revalidate_sample(
+            sample_id, reason="样品已隔离", actor=principal
+        )
+        return updated
+
+    def release_quarantine(self, principal: Principal, sample_id: int, note: str = "") -> dict[str, Any]:
+        principal.require("samples.write")
+        sample = self.samples.get(sample_id)
+        if sample["lifecycle_state"] != "quarantined":
+            raise ConflictError("样品当前不在隔离状态")
+        before = dict(sample)
+        now = to_storage(self.clock.now())
+        target = "loaned" if float(sample["reserved_quantity"]) > 0 else "available"
+        updated = self.samples.set_state(sample_id, target, sample["version"], now)
+        self.samples.append_event(
+            sample_id, "sample.quarantine.released", principal.user_id, now,
+            from_state="quarantined", to_state=target, details={"note": note},
+        )
+        self.audit.record(
+            principal, "sample.quarantine.release", "sample", str(sample_id),
+            before=before, after=updated, metadata={"note": note},
+        )
+        self._revalidate_loans(sample_id, principal)
+        return updated
 
     def consume(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.consume")
@@ -169,67 +220,44 @@ class SampleLifecycleService:
         record = dict(self.connection.execute("SELECT * FROM consumption_records WHERE id=?", (cursor.lastrowid,)).fetchone())
         self.samples.append_event(sample_id, "consumed", principal.user_id, now, quantity_delta=-data["quantity"], from_state=sample["lifecycle_state"], to_state=new_state, details={"experiment_code": data["experiment_code"]})
         self.audit.record(principal, "sample.consume", "sample", str(sample_id), before=sample, after=updated)
+        self._revalidate_loans(sample_id, principal)
         return {"record": record, "sample": updated, "replayed": False}
 
 
 class LoanService:
+    """旧版借用接口的兼容层：内部走带排队与预留的完整工作流。
+
+    管理员直接登记借用等价于"提交申请并当场批准占用"；归还委托给工作流以保证
+    候补推进与预留台账一致。
+    """
+
     def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None):
+        from app.samples.loans import LoanWorkflowService
+
         self.connection = connection
         self.clock = clock or SystemClock()
-        self.samples = SampleRepository(connection)
-        self.audit = AuditService(connection, self.clock)
+        self.workflow = LoanWorkflowService(connection, self.clock)
 
     def create(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("loans.manage")
-        sample = self.samples.get(data["sample_id"])
-        if sample["lifecycle_state"] not in {"available", "partially_consumed"}:
-            raise ConflictError("样品当前不可借用")
-        if sample["quantity"] - sample["reserved_quantity"] < data["quantity"]:
-            raise ConflictError("可借数量不足")
-        now = to_storage(self.clock.now())
-        loan_code = data.get("loan_code") or f"LOAN-{uuid.uuid4().hex[:12]}"
-        cursor = self.connection.execute(
-            """INSERT INTO loans(loan_code,sample_id,borrower_user_id,quantity,due_at,state,created_at,updated_at)
-               VALUES(?,?,?,?,?,'active',?,?)""",
-            (loan_code, data["sample_id"], data["borrower_user_id"], data["quantity"], data["due_at"], now, now),
+        request = self.workflow.apply(
+            principal,
+            {
+                "sample_id": data["sample_id"],
+                "borrower_user_id": data["borrower_user_id"],
+                "quantity": data["quantity"],
+                "requested_due_at": data["due_at"],
+                "priority": 100,
+                "request_code": data.get("loan_code"),
+            },
         )
-        self.connection.execute(
-            "UPDATE samples SET reserved_quantity=reserved_quantity+?,lifecycle_state='loaned',version=version+1,updated_at=? WHERE id=?",
-            (data["quantity"], now, data["sample_id"]),
-        )
-        loan = dict(self.connection.execute("SELECT * FROM loans WHERE id=?", (cursor.lastrowid,)).fetchone())
-        self.samples.append_event(data["sample_id"], "loaned", principal.user_id, now, from_state=sample["lifecycle_state"], to_state="loaned", details={"loan_id": loan["id"], "borrower_user_id": data["borrower_user_id"]})
-        self.audit.record(principal, "loan.create", "loan", str(loan["id"]), after=loan)
-        return loan
+        request = self.workflow.approve(principal, request["id"])
+        if not request["fulfilled_loan_id"]:
+            raise ConflictError("可借数量不足，无法直接登记借用")
+        return self.workflow._loan_view(request["fulfilled_loan_id"])
 
     def return_loan(self, principal: Principal, loan_id: int, data: dict[str, Any]) -> dict[str, Any]:
-        principal.require("loans.manage")
-        loan_row = self.connection.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone()
-        if not loan_row:
-            raise NotFoundError("借用记录不存在")
-        loan = dict(loan_row)
-        if loan["state"] not in {"active", "partially_returned", "overdue"}:
-            raise ConflictError("借用记录已经结束")
-        remaining = loan["quantity"] - loan["returned_quantity"]
-        if data["quantity"] > remaining:
-            raise ValidationError("归还数量超过未归还数量")
-        now = to_storage(self.clock.now())
-        returned = loan["returned_quantity"] + data["quantity"]
-        state = "returned" if abs(returned - loan["quantity"]) < 1e-9 else "partially_returned"
-        self.connection.execute(
-            "UPDATE loans SET returned_quantity=?,state=?,version=version+1,updated_at=? WHERE id=?",
-            (returned, state, now, loan_id),
-        )
-        self.connection.execute(
-            """UPDATE samples SET reserved_quantity=reserved_quantity-?,
-               lifecycle_state=CASE WHEN reserved_quantity-?=0 THEN CASE WHEN quantity=0 THEN 'consumed' ELSE 'available' END ELSE 'loaned' END,
-               version=version+1,updated_at=? WHERE id=?""",
-            (data["quantity"], data["quantity"], now, loan["sample_id"]),
-        )
-        result = dict(self.connection.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone())
-        self.samples.append_event(loan["sample_id"], "returned", principal.user_id, now, quantity_delta=0, details={"loan_id": loan_id, "returned_quantity": data["quantity"]})
-        self.audit.record(principal, "loan.return", "loan", str(loan_id), before=loan, after=result)
-        return result
+        return self.workflow.return_loan(principal, loan_id, data)
 
 
 class ApprovalService:
@@ -237,6 +265,7 @@ class ApprovalService:
         self.connection = connection
         self.clock = clock or SystemClock()
         self.approvals = ApprovalRepository(connection)
+        self.samples = SampleRepository(connection)
         self.audit = AuditService(connection, self.clock)
 
     def create(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
@@ -251,15 +280,61 @@ class ApprovalService:
         values["expires_at"] = values.get("expires_at") or to_storage(now_dt + timedelta(days=3))
         request_code = values.get("request_code") or f"APR-{uuid.uuid4().hex[:12]}"
         request = self.approvals.create(values, principal.user_id, request_code, to_storage(now_dt))
+        if data["action_type"] == "destruction":
+            self._enter_pending_destruction(principal, data["resource_id"], request["id"])
         self.audit.record(principal, "approval.request", "approval_request", str(request["id"]), after=request)
         return request
+
+    def _enter_pending_destruction(self, principal: Principal, sample_id: int, request_id: int) -> None:
+        from app.samples.loans import LoanWorkflowService
+
+        sample = self.samples.get(sample_id)
+        if sample["lifecycle_state"] in {"destroyed", "consumed"}:
+            raise ConflictError("样品已终结，不能发起销毁审批")
+        now = to_storage(self.clock.now())
+        updated = self.samples.set_state(sample_id, "pending_destruction", sample["version"], now)
+        self.samples.append_event(
+            sample_id, "sample.pending_destruction", principal.user_id, now,
+            from_state=sample["lifecycle_state"], to_state="pending_destruction",
+            details={"request_id": request_id},
+        )
+        self.audit.record(
+            principal, "sample.destruction.requested", "sample", str(sample_id),
+            before=sample, after=updated, metadata={"request_id": request_id},
+        )
+        LoanWorkflowService(self.connection, self.clock).revalidate_sample(
+            sample_id, reason="entered_destruction_approval", actor=principal
+        )
 
     def decide(self, principal: Principal, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("approvals.decide")
         before = self.approvals.get(request_id)
         result = self.approvals.decide(request_id, principal.user_id, data["decision"], data.get("comment", ""), to_storage(self.clock.now()))
         self.audit.record(principal, "approval.decide", "approval_request", str(request_id), before=before, after=result)
+        if before["action_type"] == "destruction" and before["state"] == "pending" and result["state"] == "rejected":
+            self._restore_from_pending_destruction(principal, result["resource_id"])
         return result
+
+    def _restore_from_pending_destruction(self, principal: Principal, sample_id: int) -> None:
+        from app.samples.loans import LoanWorkflowService
+
+        sample = self.samples.get(sample_id)
+        if sample["lifecycle_state"] != "pending_destruction":
+            return
+        now = to_storage(self.clock.now())
+        target = "loaned" if float(sample["reserved_quantity"]) > 0 else "available"
+        updated = self.samples.set_state(sample_id, target, sample["version"], now)
+        self.samples.append_event(
+            sample_id, "sample.destruction.rejected", principal.user_id, now,
+            from_state="pending_destruction", to_state=target,
+        )
+        self.audit.record(
+            principal, "sample.destruction.restored", "sample", str(sample_id),
+            before=sample, after=updated,
+        )
+        LoanWorkflowService(self.connection, self.clock).revalidate_sample(
+            sample_id, reason="destruction_rejected", actor=principal
+        )
 
 
 class AnomalyService:
