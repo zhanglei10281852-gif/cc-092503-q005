@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
-from app.core.errors import ConflictError, NotFoundError, ValidationError
+from app.core.errors import ConflictError, ValidationError
 from app.core.security import Principal
 from app.samples.repository import AnomalyRepository, ApprovalRepository, BatchRepository, LocationRepository, SampleRepository
 from app.services.audit import AuditService
@@ -142,7 +142,10 @@ class SampleLifecycleService:
         )
         self.samples.append_event(sample_id, "aliquot.source", principal.user_id, now, quantity_delta=-data["requested_quantity"], details={"operation_code": operation_code, "child_ids": [item["id"] for item in children]})
         self.audit.record(principal, "sample.aliquot", "sample", str(sample_id), before=parent, after=updated_parent, metadata={"operation_code": operation_code})
-        return {"operation_code": operation_code, "parent": updated_parent, "children": children}
+        from app.samples.loans import revalidate_sample_requests
+
+        revalidation = revalidate_sample_requests(self.connection, sample_id, trigger="aliquot", actor=principal, clock=self.clock)
+        return {"operation_code": operation_code, "parent": self.samples.get(sample_id), "children": children, "revalidation": revalidation}
 
     def consume(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.consume")
@@ -169,67 +172,10 @@ class SampleLifecycleService:
         record = dict(self.connection.execute("SELECT * FROM consumption_records WHERE id=?", (cursor.lastrowid,)).fetchone())
         self.samples.append_event(sample_id, "consumed", principal.user_id, now, quantity_delta=-data["quantity"], from_state=sample["lifecycle_state"], to_state=new_state, details={"experiment_code": data["experiment_code"]})
         self.audit.record(principal, "sample.consume", "sample", str(sample_id), before=sample, after=updated)
-        return {"record": record, "sample": updated, "replayed": False}
+        from app.samples.loans import revalidate_sample_requests
 
-
-class LoanService:
-    def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None):
-        self.connection = connection
-        self.clock = clock or SystemClock()
-        self.samples = SampleRepository(connection)
-        self.audit = AuditService(connection, self.clock)
-
-    def create(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
-        principal.require("loans.manage")
-        sample = self.samples.get(data["sample_id"])
-        if sample["lifecycle_state"] not in {"available", "partially_consumed"}:
-            raise ConflictError("样品当前不可借用")
-        if sample["quantity"] - sample["reserved_quantity"] < data["quantity"]:
-            raise ConflictError("可借数量不足")
-        now = to_storage(self.clock.now())
-        loan_code = data.get("loan_code") or f"LOAN-{uuid.uuid4().hex[:12]}"
-        cursor = self.connection.execute(
-            """INSERT INTO loans(loan_code,sample_id,borrower_user_id,quantity,due_at,state,created_at,updated_at)
-               VALUES(?,?,?,?,?,'active',?,?)""",
-            (loan_code, data["sample_id"], data["borrower_user_id"], data["quantity"], data["due_at"], now, now),
-        )
-        self.connection.execute(
-            "UPDATE samples SET reserved_quantity=reserved_quantity+?,lifecycle_state='loaned',version=version+1,updated_at=? WHERE id=?",
-            (data["quantity"], now, data["sample_id"]),
-        )
-        loan = dict(self.connection.execute("SELECT * FROM loans WHERE id=?", (cursor.lastrowid,)).fetchone())
-        self.samples.append_event(data["sample_id"], "loaned", principal.user_id, now, from_state=sample["lifecycle_state"], to_state="loaned", details={"loan_id": loan["id"], "borrower_user_id": data["borrower_user_id"]})
-        self.audit.record(principal, "loan.create", "loan", str(loan["id"]), after=loan)
-        return loan
-
-    def return_loan(self, principal: Principal, loan_id: int, data: dict[str, Any]) -> dict[str, Any]:
-        principal.require("loans.manage")
-        loan_row = self.connection.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone()
-        if not loan_row:
-            raise NotFoundError("借用记录不存在")
-        loan = dict(loan_row)
-        if loan["state"] not in {"active", "partially_returned", "overdue"}:
-            raise ConflictError("借用记录已经结束")
-        remaining = loan["quantity"] - loan["returned_quantity"]
-        if data["quantity"] > remaining:
-            raise ValidationError("归还数量超过未归还数量")
-        now = to_storage(self.clock.now())
-        returned = loan["returned_quantity"] + data["quantity"]
-        state = "returned" if abs(returned - loan["quantity"]) < 1e-9 else "partially_returned"
-        self.connection.execute(
-            "UPDATE loans SET returned_quantity=?,state=?,version=version+1,updated_at=? WHERE id=?",
-            (returned, state, now, loan_id),
-        )
-        self.connection.execute(
-            """UPDATE samples SET reserved_quantity=reserved_quantity-?,
-               lifecycle_state=CASE WHEN reserved_quantity-?=0 THEN CASE WHEN quantity=0 THEN 'consumed' ELSE 'available' END ELSE 'loaned' END,
-               version=version+1,updated_at=? WHERE id=?""",
-            (data["quantity"], data["quantity"], now, loan["sample_id"]),
-        )
-        result = dict(self.connection.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone())
-        self.samples.append_event(loan["sample_id"], "returned", principal.user_id, now, quantity_delta=0, details={"loan_id": loan_id, "returned_quantity": data["quantity"]})
-        self.audit.record(principal, "loan.return", "loan", str(loan_id), before=loan, after=result)
-        return result
+        revalidation = revalidate_sample_requests(self.connection, sample_id, trigger="consumed", actor=principal, clock=self.clock)
+        return {"record": record, "sample": self.samples.get(sample_id), "replayed": False, "revalidation": revalidation}
 
 
 class ApprovalService:
@@ -252,13 +198,26 @@ class ApprovalService:
         request_code = values.get("request_code") or f"APR-{uuid.uuid4().hex[:12]}"
         request = self.approvals.create(values, principal.user_id, request_code, to_storage(now_dt))
         self.audit.record(principal, "approval.request", "approval_request", str(request["id"]), after=request)
-        return request
+        revalidation = None
+        if request["action_type"] == "destruction" and request["resource_type"] == "sample":
+            from app.samples.loans import revalidate_sample_requests
+
+            revalidation = revalidate_sample_requests(
+                self.connection, request["resource_id"], trigger="destruction_requested", actor=principal, clock=self.clock
+            )
+        return {**request, "revalidation": revalidation}
 
     def decide(self, principal: Principal, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("approvals.decide")
         before = self.approvals.get(request_id)
         result = self.approvals.decide(request_id, principal.user_id, data["decision"], data.get("comment", ""), to_storage(self.clock.now()))
         self.audit.record(principal, "approval.decide", "approval_request", str(request_id), before=before, after=result)
+        if result["action_type"] == "destruction" and result["resource_type"] == "sample":
+            from app.samples.loans import revalidate_sample_requests
+
+            result["revalidation"] = revalidate_sample_requests(
+                self.connection, result["resource_id"], trigger=f"destruction_{result['state']}", actor=principal, clock=self.clock
+            )
         return result
 
 

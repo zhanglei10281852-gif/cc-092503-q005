@@ -73,8 +73,8 @@ def test_loan_partial_and_full_return(client, admin):
     assert loan.status_code == 201, loan.text
     partial = client.post(f"/api/samples/loans/{loan.json()['id']}/returns", headers=admin["headers"], json={"quantity": 5})
     finished = client.post(f"/api/samples/loans/{loan.json()['id']}/returns", headers=admin["headers"], json={"quantity": 15})
-    assert partial.json()["state"] == "partially_returned"
-    assert finished.json()["state"] == "returned"
+    assert partial.json()["loan"]["state"] == "partially_returned"
+    assert finished.json()["loan"]["state"] == "returned"
 
 
 def test_two_distinct_approvers_required(client, admin):

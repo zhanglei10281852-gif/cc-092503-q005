@@ -12,12 +12,10 @@ from app.samples.schemas import (
     ApprovalDecision,
     BatchCreate,
     ConsumptionCreate,
-    LoanCreate,
-    LoanReturn,
     LocationCreate,
     SampleCreate,
 )
-from app.samples.service import AnomalyService, ApprovalService, LoanService, LocationService, SampleLifecycleService
+from app.samples.service import AnomalyService, ApprovalService, LocationService, SampleLifecycleService
 
 router = APIRouter(prefix="/api/samples", tags=["科研样品"])
 
@@ -69,18 +67,6 @@ def aliquot(sample_id: int, payload: AliquotRequest, principal: Principal = Depe
 def consume(sample_id: int, payload: ConsumptionCreate, principal: Principal = Depends(current_principal)):
     with transaction(immediate=True) as connection:
         return SampleLifecycleService(connection).consume(principal, sample_id, payload.model_dump())
-
-
-@router.post("/loans", status_code=status.HTTP_201_CREATED)
-def create_loan(payload: LoanCreate, principal: Principal = Depends(current_principal)):
-    with transaction(immediate=True) as connection:
-        return LoanService(connection).create(principal, payload.model_dump())
-
-
-@router.post("/loans/{loan_id}/returns")
-def return_loan(loan_id: int, payload: LoanReturn, principal: Principal = Depends(current_principal)):
-    with transaction(immediate=True) as connection:
-        return LoanService(connection).return_loan(principal, loan_id, payload.model_dump())
 
 
 @router.post("/approvals", status_code=status.HTTP_201_CREATED)

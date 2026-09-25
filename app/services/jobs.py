@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import timedelta
 
 from app.core.clock import Clock, SystemClock, from_storage, to_storage
@@ -13,8 +14,23 @@ class JobService:
         self.connection = connection
         self.clock = clock or SystemClock()
 
-    def enqueue(self, job_type: str, deduplication_key: str, payload: dict, *, delay_seconds: int = 0) -> dict:
+    def enqueue(self, job_type: str, deduplication_key: str, payload: dict, *, delay_seconds: int = 0, active_dedup: bool = False) -> dict:
         now = self.clock.now()
+        if active_dedup:
+            active = self.connection.execute(
+                "SELECT * FROM background_jobs "
+                "WHERE (deduplication_key=? OR deduplication_key LIKE ?) "
+                "AND status IN ('pending','running')",
+                (deduplication_key, deduplication_key + ":%"),
+            ).fetchone()
+            if active is not None:
+                return dict(active)
+            finished = self.connection.execute(
+                "SELECT 1 FROM background_jobs WHERE deduplication_key=?", (deduplication_key,)
+            ).fetchone()
+            if finished is not None:
+                # the base key already has a completed job; allow a new run under a unique key
+                deduplication_key = f"{deduplication_key}:{uuid.uuid4().hex}"
         try:
             cursor = self.connection.execute(
                 "INSERT INTO background_jobs(job_type,deduplication_key,payload_json,status,available_at,created_at,updated_at) "

@@ -201,7 +201,12 @@ class DestructionService:
             after=updated,
             metadata={"request_id": request_id, "certificate_digest": certificate},
         )
-        return {"record": record, "sample": updated, "replayed": False}
+        from app.samples.loans import revalidate_sample_requests
+
+        revalidation = revalidate_sample_requests(
+            self.connection, sample["id"], trigger="destroyed", actor=principal, clock=self.clock
+        )
+        return {"record": record, "sample": self.samples.get(sample["id"]), "replayed": False, "revalidation": revalidation}
 
 
 class LineageService:

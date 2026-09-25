@@ -92,3 +92,33 @@ class AnomalyCreate(BaseModel):
         if not self.sample_id and not self.batch_id:
             raise ValueError("sample_id 与 batch_id 至少填写一个")
         return self
+
+
+class LoanRequestCreate(BaseModel):
+    sample_id: int = Field(gt=0)
+    quantity: float = Field(gt=0)
+    priority: Literal[1, 2, 3] = 3
+    needed_by: str | None = Field(default=None, min_length=10, max_length=40)
+    note: str = Field(default="", max_length=500)
+
+
+class LoanRequestDecide(BaseModel):
+    note: str = Field(default="", max_length=500)
+
+
+class LoanRenewalCreate(BaseModel):
+    new_due_at: str = Field(min_length=10, max_length=40)
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class LoanRenewalDecide(BaseModel):
+    note: str = Field(default="", max_length=500)
+
+
+class QuarantineSet(BaseModel):
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class InventoryAdjust(BaseModel):
+    new_quantity: float = Field(ge=0)
+    reason: str = Field(min_length=2, max_length=500)

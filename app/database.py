@@ -190,6 +190,8 @@ CREATE TABLE IF NOT EXISTS samples (
     location_id INTEGER REFERENCES storage_locations(id),
     custody_user_id INTEGER REFERENCES users(id),
     lineage_depth INTEGER NOT NULL DEFAULT 0,
+    quarantine_reason TEXT NOT NULL DEFAULT '',
+    adjusted_at TEXT,
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -217,7 +219,7 @@ CREATE TABLE IF NOT EXISTS loans (
     loan_code TEXT NOT NULL UNIQUE,
     sample_id INTEGER NOT NULL REFERENCES samples(id),
     borrower_user_id INTEGER NOT NULL REFERENCES users(id),
-    approved_request_id INTEGER REFERENCES approval_requests(id),
+    approved_request_id INTEGER REFERENCES loan_requests(id),
     quantity REAL NOT NULL CHECK(quantity > 0),
     due_at TEXT NOT NULL,
     returned_quantity REAL NOT NULL DEFAULT 0 CHECK(returned_quantity >= 0),
@@ -227,6 +229,72 @@ CREATE TABLE IF NOT EXISTS loans (
     updated_at TEXT NOT NULL,
     CHECK(returned_quantity <= quantity)
 );
+
+CREATE TABLE IF NOT EXISTS loan_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_code TEXT NOT NULL UNIQUE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    applicant_user_id INTEGER NOT NULL REFERENCES users(id),
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    priority INTEGER NOT NULL DEFAULT 3 CHECK(priority IN (1,2,3)),
+    needed_by TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','waiting','fulfilled','rejected','cancelled','expired','blocked')),
+    block_reason TEXT,
+    previous_state TEXT,
+    decided_by INTEGER REFERENCES users(id),
+    decided_at TEXT,
+    decision_note TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loan_requests_queue ON loan_requests(sample_id, state, priority, id);
+CREATE INDEX IF NOT EXISTS idx_loan_requests_applicant ON loan_requests(applicant_user_id, state);
+
+CREATE TABLE IF NOT EXISTS loan_request_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES loan_requests(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    actor_user_id INTEGER REFERENCES users(id),
+    from_state TEXT,
+    to_state TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loan_request_events_request ON loan_request_events(request_id, id);
+
+CREATE TABLE IF NOT EXISTS loan_renewals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    renewal_code TEXT NOT NULL UNIQUE,
+    loan_id INTEGER NOT NULL REFERENCES loans(id),
+    requested_by INTEGER NOT NULL REFERENCES users(id),
+    new_due_at TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','approved','rejected')),
+    decided_by INTEGER REFERENCES users(id),
+    decided_at TEXT,
+    decision_note TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loan_renewals_loan ON loan_renewals(loan_id, state);
+
+CREATE TABLE IF NOT EXISTS loan_recalls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recall_code TEXT NOT NULL UNIQUE,
+    loan_id INTEGER NOT NULL REFERENCES loans(id),
+    episode INTEGER NOT NULL,
+    overdue_days REAL NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','returned','cancelled')),
+    created_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    closed_at TEXT,
+    UNIQUE(loan_id, episode)
+);
+CREATE INDEX IF NOT EXISTS idx_loan_recalls_loan ON loan_recalls(loan_id);
 
 CREATE TABLE IF NOT EXISTS consumption_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -349,6 +417,7 @@ PERMISSIONS = [
     ("samples.consume", "登记消耗", "samples", "consume"),
     ("samples.destroy", "执行销毁", "samples", "destroy"),
     ("loans.manage", "管理借用", "loans", "manage"),
+    ("loans.apply", "申请借用", "loans", "apply"),
     ("inventory.manage", "管理盘点", "inventory", "manage"),
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("locations.read_sensitive", "查看精确保管位置", "locations", "read_sensitive"),
@@ -401,10 +470,27 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_columns(connection: sqlite3.Connection) -> None:
+    """Apply additive column upgrades to databases created by older versions."""
+    loan_columns = _table_columns(connection, "loans")
+    if loan_columns and "approved_request_id" not in loan_columns:
+        connection.execute("ALTER TABLE loans ADD COLUMN approved_request_id INTEGER")
+    sample_columns = _table_columns(connection, "samples")
+    if sample_columns and "quarantine_reason" not in sample_columns:
+        connection.execute("ALTER TABLE samples ADD COLUMN quarantine_reason TEXT NOT NULL DEFAULT ''")
+    if sample_columns and "adjusted_at" not in sample_columns:
+        connection.execute("ALTER TABLE samples ADD COLUMN adjusted_at TEXT")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     connection = get_connection()
     connection.executescript(SCHEMA)
+    _migrate_columns(connection)
     with transaction(immediate=True) as connection:
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
@@ -433,7 +519,7 @@ def init_db() -> None:
                 "samples.read", "samples.write", "samples.consume", "samples.destroy",
                 "loans.manage", "inventory.manage", "anomalies.manage",
             ],
-            "researcher": ["samples.read", "samples.consume"],
+            "researcher": ["samples.read", "samples.consume", "loans.apply"],
             "approver": ["samples.read", "approvals.decide"],
             "auditor": ["samples.read", "audit.read"],
         }
